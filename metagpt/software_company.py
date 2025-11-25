@@ -7,13 +7,14 @@ from pathlib import Path
 import typer
 
 from metagpt.const import CONFIG_ROOT
+from metagpt.logs import logger
 
 app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 
 
 def generate_repo(
     idea,
-    investment=3.0,
+    investment=0.1,
     n_round=5,
     code_review=True,
     run_tests=False,
@@ -70,6 +71,16 @@ def generate_repo(
 
     company.invest(investment)
     asyncio.run(company.run(n_round=n_round, idea=idea))
+
+    costs = ctx.cost_manager.get_costs()
+    total_tokens = costs.total_prompt_tokens + costs.total_completion_tokens
+    logger.info(
+        "LLM token usage | prompt: {prompt} | completion: {completion} | total: {total} | cost: ${cost:.6f}",
+        prompt=costs.total_prompt_tokens,
+        completion=costs.total_completion_tokens,
+        total=total_tokens,
+        cost=costs.total_cost,
+    )
 
     return ctx.kwargs.get("project_path")
 

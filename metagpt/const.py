@@ -38,7 +38,20 @@ def get_metagpt_root():
 # METAGPT PROJECT ROOT AND VARS
 CONFIG_ROOT = Path.home() / ".metagpt"
 METAGPT_ROOT = get_metagpt_root()  # Dependent on METAGPT_PROJECT_ROOT
-DEFAULT_WORKSPACE_ROOT = METAGPT_ROOT / "workspace"
+
+
+def get_workspace_root() -> Path:
+    workspace_root_env = os.getenv("METAGPT_WORKSPACE_ROOT")
+    if workspace_root_env:
+        workspace_root = Path(workspace_root_env).expanduser().resolve()
+        logger.info(f"WORKSPACE_ROOT set from environment variable to {str(workspace_root)}")
+    else:
+        workspace_root = Path.cwd() / "workspace"
+        logger.info(f"WORKSPACE_ROOT defaulting to {str(workspace_root)}")
+    return workspace_root
+
+
+DEFAULT_WORKSPACE_ROOT = get_workspace_root()
 
 EXAMPLE_PATH = METAGPT_ROOT / "examples"
 EXAMPLE_DATA_PATH = EXAMPLE_PATH / "data"

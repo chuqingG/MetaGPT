@@ -43,6 +43,7 @@ TOKEN_COSTS = {
     "gpt-4o-mini-2024-07-18": {"prompt": 0.00015, "completion": 0.0006},
     "gpt-4o-2024-05-13": {"prompt": 0.005, "completion": 0.015},
     "gpt-4o-2024-08-06": {"prompt": 0.0025, "completion": 0.01},
+    "gpt-5-mini": {"prompt": 0.00025, "completion": 0.002},
     "o1-preview": {"prompt": 0.015, "completion": 0.06},
     "o1-preview-2024-09-12": {"prompt": 0.015, "completion": 0.06},
     "o1-mini": {"prompt": 0.003, "completion": 0.012},

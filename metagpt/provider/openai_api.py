@@ -12,7 +12,7 @@ import json
 import re
 from typing import Optional, Union
 
-from openai import APIConnectionError, AsyncOpenAI, AsyncStream
+from openai import APIConnectionError, AsyncOpenAI, AsyncStream, BadRequestError
 from openai._base_client import AsyncHttpxClientWrapper
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
@@ -33,11 +33,7 @@ from metagpt.provider.llm_provider_registry import register_provider
 from metagpt.utils.common import CodeParser, decode_image, log_and_reraise
 from metagpt.utils.cost_manager import CostManager
 from metagpt.utils.exceptions import handle_exception
-from metagpt.utils.token_counter import (
-    count_message_tokens,
-    count_output_tokens,
-    get_max_completion_tokens,
-)
+from metagpt.utils.token_counter import count_message_tokens, get_max_completion_tokens
 
 
 @register_provider(
@@ -63,6 +59,14 @@ class OpenAILLM(BaseLLM):
         self._init_client()
         self.auto_max_tokens = False
         self.cost_manager: Optional[CostManager] = None
+        self._max_tokens_param_name = "max_tokens"
+        self._temperature_override: Optional[float] = None
+        if self._should_disable_streaming_for_usage() and self.config.stream:
+            logger.info(
+                "Disabling streaming for %s to capture token usage from Chat Completions API.",
+                self.config.model,
+            )
+            self.config.stream = False
 
     def _init_client(self):
         """https://github.com/openai/openai-python#async-usage"""
@@ -89,10 +93,13 @@ class OpenAILLM(BaseLLM):
 
         return params
 
+    def _should_disable_streaming_for_usage(self) -> bool:
+        model = (self.model or self.config.model or "").lower()
+        return model.startswith("gpt-5")
+
     async def _achat_completion_stream(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> str:
-        response: AsyncStream[ChatCompletionChunk] = await self.aclient.chat.completions.create(
-            **self._cons_kwargs(messages, timeout=self.get_timeout(timeout)), stream=True
-        )
+        kwargs = self._cons_kwargs(messages, timeout=self.get_timeout(timeout))
+        response: AsyncStream[ChatCompletionChunk] = await self._create_chat_completion(kwargs, stream=True)
         usage = None
         collected_messages = []
         collected_reasoning_messages = []
@@ -138,24 +145,29 @@ class OpenAILLM(BaseLLM):
     def _cons_kwargs(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT, **extra_kwargs) -> dict:
         kwargs = {
             "messages": messages,
-            "max_tokens": self._get_max_tokens(messages),
             # "n": 1,  # Some services do not provide this parameter, such as mistral
             # "stop": None,  # default it's None and gpt4-v can't have this one
-            "temperature": self.config.temperature,
+            "temperature": self._temperature_override
+            if self._temperature_override is not None
+            else self.config.temperature,
             "model": self.model,
             "timeout": self.get_timeout(timeout),
         }
+        max_tokens = self._get_max_tokens(messages)
+        if self._max_tokens_param_name and max_tokens is not None:
+            kwargs[self._max_tokens_param_name] = max_tokens
         if "o1-" in self.model:
             # compatible to openai o1-series
             kwargs["temperature"] = 1
-            kwargs.pop("max_tokens")
+            kwargs.pop("max_tokens", None)
+            kwargs.pop("max_completion_tokens", None)
         if extra_kwargs:
             kwargs.update(extra_kwargs)
         return kwargs
 
     async def _achat_completion(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> ChatCompletion:
         kwargs = self._cons_kwargs(messages, timeout=self.get_timeout(timeout))
-        rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
+        rsp: ChatCompletion = await self._create_chat_completion(kwargs)
         self._update_costs(rsp.usage)
         return rsp
 
@@ -182,7 +194,7 @@ class OpenAILLM(BaseLLM):
     ) -> ChatCompletion:
         messages = self.format_msg(messages)
         kwargs = self._cons_kwargs(messages=messages, timeout=self.get_timeout(timeout), **chat_configs)
-        rsp: ChatCompletion = await self.aclient.chat.completions.create(**kwargs)
+        rsp: ChatCompletion = await self._create_chat_completion(kwargs)
         self._update_costs(rsp.usage)
         return rsp
 
@@ -271,12 +283,7 @@ class OpenAILLM(BaseLLM):
         if not self.config.calc_usage:
             return usage
 
-        try:
-            usage.prompt_tokens = count_message_tokens(messages, self.pricing_plan)
-            usage.completion_tokens = count_output_tokens(rsp, self.pricing_plan)
-        except Exception as e:
-            logger.warning(f"usage calculation failed: {e}")
-
+        logger.debug("Provider did not include usage metrics; leaving token counts as zero.")
         return usage
 
     def _get_max_tokens(self, messages: list[dict]):
@@ -285,6 +292,63 @@ class OpenAILLM(BaseLLM):
         # FIXME
         # https://community.openai.com/t/why-is-gpt-3-5-turbo-1106-max-tokens-limited-to-4096/494973/3
         return min(get_max_completion_tokens(messages, self.model, self.config.max_token), 4096)
+
+    async def _create_chat_completion(self, kwargs: dict, stream: bool = False):
+        stream = kwargs.pop("stream", stream)
+        attempt_kwargs = dict(kwargs)
+        for _ in range(3):
+            try:
+                return await self.aclient.chat.completions.create(**attempt_kwargs, stream=stream)
+            except BadRequestError as exc:
+                updated_kwargs = None
+                if self._should_retry_with_completion_param(exc, attempt_kwargs):
+                    updated_kwargs = self._convert_to_completion_param(dict(attempt_kwargs))
+                elif self._should_retry_with_default_temperature(exc, attempt_kwargs):
+                    updated_kwargs = self._convert_to_default_temperature(dict(attempt_kwargs))
+                if not updated_kwargs:
+                    raise
+                attempt_kwargs = updated_kwargs
+        raise
+
+    def _should_retry_with_completion_param(self, exc: BadRequestError, kwargs: dict) -> bool:
+        if "max_tokens" not in kwargs:
+            return False
+        error_message = ""
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error_message = body.get("error", {}).get("message", "")
+        if not error_message:
+            error_message = str(exc)
+        return "Unsupported parameter: 'max_tokens'" in error_message
+
+    def _convert_to_completion_param(self, kwargs: dict) -> dict:
+        max_tokens = kwargs.pop("max_tokens", None)
+        if max_tokens is not None:
+            kwargs["max_completion_tokens"] = max_tokens
+            self._max_tokens_param_name = "max_completion_tokens"
+            logger.info(
+                "Switching to max_completion_tokens for model %s per OpenAI API response", self.model
+            )
+        return kwargs
+
+    def _should_retry_with_default_temperature(self, exc: BadRequestError, kwargs: dict) -> bool:
+        if "temperature" not in kwargs:
+            return False
+        error_message = ""
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error_message = body.get("error", {}).get("message", "")
+        if not error_message:
+            error_message = str(exc)
+        return "Unsupported value: 'temperature'" in error_message
+
+    def _convert_to_default_temperature(self, kwargs: dict) -> dict:
+        kwargs["temperature"] = 1
+        self._temperature_override = 1
+        logger.info(
+            "Switching to temperature=1 for model %s per OpenAI API response", self.model
+        )
+        return kwargs
 
     @handle_exception
     async def amoderation(self, content: Union[str, list[str]]):

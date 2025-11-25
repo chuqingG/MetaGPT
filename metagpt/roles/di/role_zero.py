@@ -5,6 +5,7 @@ import json
 import re
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Callable, Literal, Optional, Tuple
 
 from pydantic import Field, model_validator
@@ -12,6 +13,7 @@ from pydantic import Field, model_validator
 from metagpt.actions import Action, UserRequirement
 from metagpt.actions.di.run_command import RunCommand
 from metagpt.actions.search_enhanced_qa import SearchEnhancedQA
+from metagpt.const import DEFAULT_WORKSPACE_ROOT
 from metagpt.exp_pool import exp_cache
 from metagpt.exp_pool.context_builders import RoleZeroContextBuilder
 from metagpt.exp_pool.serializers import RoleZeroSerializer
@@ -372,6 +374,9 @@ class RoleZero(Role):
             answer = await SearchEnhancedQA().run(query)
 
         if answer:
+            saved_path = self._persist_quick_answer(answer)
+            if saved_path:
+                answer = f"{answer.strip()}\n\nSaved to: {saved_path}"
             self.rc.memory.add(AIMessage(content=answer, cause_by=QUICK_THINK_TAG))
             await self.reply_to_human(content=answer)
             rsp_msg = AIMessage(
@@ -381,6 +386,19 @@ class RoleZero(Role):
             )
 
         return rsp_msg, intent_result
+
+    def _persist_quick_answer(self, content: str) -> Optional[Path]:
+        try:
+            target_dir = DEFAULT_WORKSPACE_ROOT
+            target_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"quick_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            file_path = target_dir / filename
+            file_path.write_text(content.strip() + "\n", encoding="utf-8")
+            logger.info(f"Quick response saved to {file_path}")
+            return file_path
+        except Exception as exc:
+            logger.warning(f"Failed to persist quick answer: {exc}")
+            return None
 
     async def _run_commands(self, commands) -> str:
         outputs = []
